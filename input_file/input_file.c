@@ -46,22 +46,23 @@ typedef enum _read_mode {
 
 /* private functions and variables to this plugin */
 static pthread_t   worker;
+static pthread_t   recvWorker;
 static globals     *pglobal;
 
 void *worker_thread(void *);
 void worker_cleanup(void *);
 void help(void);
-void *senderThread(int);
+void *recvThread(void *);
 static double delay = 1.0;
-static char *cmd = NULL;
-static int cmdLength = 0;
+
 
 static char *filename = NULL;
 static int rm = 0;
 static int plugin_number;
 static read_mode mode = NewFilesOnly;
 static int PORT = 19090;
-static char *IP = "127.0.0.1";
+static int server_fd = 0;
+static int conn_fd = 0;
 
 /* global variables for this plugin */
 static int fd, rc, wd, size;
@@ -98,6 +99,7 @@ int input_stop(int id)
 {
     DBG("will cancel input thread\n");
     pthread_cancel(worker);
+    pthread_cancel(recvWorker);
     return 0;
 }
 
@@ -108,7 +110,14 @@ int input_run(int id)
 
     int server_sockfd = socket(AF_INET,SOCK_STREAM, 0);
     int conn;
-     
+    
+    int rcvBufSize = 1024*1024;
+    int optlen = sizeof(rcvBufSize);
+    if (setsockopt(server_sockfd, SOL_SOCKET, SO_RCVBUF, &rcvBufSize, optlen) < 0)//important, make sure buffer size
+    {
+        perror("setsockopt");
+        exit(1);
+    }
     struct sockaddr_in server_sockaddr;
     bzero(&server_sockaddr, sizeof(server_sockaddr));
     server_sockaddr.sin_family = AF_INET;//IPv4
@@ -123,7 +132,7 @@ int input_run(int id)
         exit(1);
     }
         
-    printf("bind success, start listen!");
+    DBG("bind success, start listen!\n");
  
     ///listen£¬³É¹¦·µ»Ø0£¬³ö´í·µ»Ø-1
     if(listen(server_sockfd,QUEUE) == -1)
@@ -132,15 +141,23 @@ int input_run(int id)
         exit(1);
     }
     DBG("ready to create socket thread : %d\n", server_sockfd);
-    if(pthread_create(&worker, 0, worker_thread, &server_sockfd) != 0) {
+    server_fd = server_sockfd;//save to global value
+    conn_fd = 0;
+    if(pthread_create(&worker, 0, worker_thread, NULL) != 0) {
         //free(pglobal->in[id].buf);
         fprintf(stderr, "could not start worker thread\n");
         exit(EXIT_FAILURE);
     }
 
-       pthread_detach(worker);
-
-       return 0;
+    /*if(pthread_create(&recvWorker, 0, recvThread, NULL) != 0) {
+        //free(pglobal->in[id].buf);
+        fprintf(stderr, "could not start recvThread\n");
+        exit(EXIT_FAILURE);
+    }*/
+    pthread_detach(worker);
+    //pthread_detach(recvWorker);
+    DBG("input_run ..finish\n");
+    return 0;
 }
 
 /*** private functions for this plugin below ***/
@@ -164,27 +181,33 @@ void *worker_thread(void *arg)
     /* set cleanup handler to cleanup allocated resources */
     pthread_cleanup_push(worker_cleanup, NULL);
     int conn;
-    int server_sockfd = *((int*)arg);
-    DBG("success create socket thread : %d\n", server_sockfd);
+    //int server_sockfd = *((int*)arg);
+    DBG("success create socket thread, wait for client connect....sockfd: %d\n", server_fd);
     while(!pglobal->stop)
     {
-        pthread_t thread;
+        //pthread_t thread;
 
         struct sockaddr_in client_addr;
         socklen_t length = sizeof(client_addr);
  
-        if (-1 == (conn = accept(server_sockfd, (struct sockaddr*)&client_addr, &length)))
+        if (-1 == (conn = accept(server_fd, (struct sockaddr*)&client_addr, &length)))
         {
             perror("accept");
             break;
         }
-        
-        DBG("will pthread_create senderThread()\n");
-        if (0!= pthread_create(&thread, NULL, senderThread, conn))
+        if (conn == 0) {
+            continue;
+        }
+        conn_fd = conn; //important!this meas only last client will be used
+        int * tmp = malloc(sizeof(int));
+        *tmp = conn;
+        DBG("client connect! conn_id:%d pthread_create senderThread()\n", conn);
+        if (0!= pthread_create(&recvWorker, 0, recvThread, tmp))
         {
             perror("pthread_create");
-            break;
+            break; 
         }
+        DBG("client connect! conn id:%d \n ", conn_fd);
     }
 
 thread_quit:
@@ -197,26 +220,44 @@ thread_quit:
 }
 
 
-void *senderThread(int conn_fd)
+void *recvThread(void *arg)
 {
-    //char recv_buf[BUFFER_SIZE];
-    while(1) {
+    int conn = *((int*)arg);
+    DBG("recvThread running ....conn_fd:%d\n", conn);
 
-        if (cmd != NULL && strlen(cmd) > 0) {
-            DBG("ready to send cmd : %s\n", cmd);
-            if(send(conn_fd, cmd, strlen(cmd), 0) < 0)
-            {
-                free(cmd);
-                cmd = NULL;
-                perror("send");
-                break;
+    while(!pglobal->stop) {
+        if (conn > 0) {
+            char recv_buf[1024*1024];
+            int recv_length = recv(conn, recv_buf, sizeof(recv_buf), 0);
+            if (recv_length > 0) {
+                DBG("jgp data received,conn_fd:%d data len:%d\n", conn, recv_length);
+                //onImageReceived(recv_buf, recv_length);
             }
-            free(cmd);
-            cmd = NULL;
         }
-
         sleep(1);
     }
+    return NULL;
+}
+
+void onImageReceived(char *data, int length){
+        /* copy JPG picture to global buffer */
+        pthread_mutex_lock(&pglobal->in[plugin_number].db);
+
+        /* allocate memory for frame */
+        if(pglobal->in[plugin_number].buf != NULL)
+            free(pglobal->in[plugin_number].buf);
+            
+        pglobal->in[plugin_number].buf = malloc(length + 1);
+        pglobal->in[plugin_number].size = length;
+        memcpy(pglobal->in[plugin_number].buf, data, pglobal->in[plugin_number].size);
+        struct timeval timestamp;
+        gettimeofday(&timestamp, NULL);
+        //pglobal->in[plugin_number].timestamp = timestamp;
+        DBG("new frame copied (size: %d)\n", pglobal->in[plugin_number].size);
+        /* signal fresh_frame */
+        pthread_cond_broadcast(&pglobal->in[plugin_number].db_update);
+        pthread_mutex_unlock(&pglobal->in[plugin_number].db);
+
 }
 
 void worker_cleanup(void *arg)
@@ -231,8 +272,10 @@ void worker_cleanup(void *arg)
     first_run = 0;
     DBG("cleaning up resources allocated by input thread\n");
 
-    if(pglobal->in[plugin_number].buf != NULL) free(pglobal->in[plugin_number].buf);
-
+    if(pglobal->in[plugin_number].buf != NULL) {
+        free(pglobal->in[plugin_number].buf);
+        pglobal->in[plugin_number].buf = NULL;
+    }
 }
 
 int input_cmd(int plugin, int command_id, int group, int value, char* sValue)
@@ -241,14 +284,13 @@ int input_cmd(int plugin, int command_id, int group, int value, char* sValue)
     int i;
     DBG("Requested cmd (id: %d) for the %d plugin. Group: %d value: %d string: %s \n", command_id, plugin, group, value, sValue);
     if (value > 0 && sValue != NULL) {
-        cmd = malloc((1+strlen(sValue))*sizeof(char));
-        sprintf(cmd, "%s", sValue);
-        cmdLength = strlen(sValue);
+        char *tmp = malloc((1+strlen(sValue))*sizeof(char));
+        sprintf(tmp, "%s", sValue);
+        int cmdLength = strlen(sValue);
+        if(send(conn_fd, tmp, cmdLength, 0) < 0) {
+            DBG("send cmd error! \n");
+        }
+        free(tmp);
     }
     return 0;
 }
-
-
-
-
-
